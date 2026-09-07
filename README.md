@@ -66,8 +66,9 @@ The kernel divides the attention calculation into manageable chunks:
 
 ## 📜 License
 
-This project is licensed under the MIT License - see your choice of license for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## 🤝 Acknowledgments
 
-* Tri Dao et al. for the original ground-breaking paper: [*FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*]([https://arxiv.org](https://arxiv.org/abs/2205.14135)).
+* Tri Dao et al. for the original ground-breaking paper: [*FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*](https://arxiv.org/abs/2205.14135).
+
