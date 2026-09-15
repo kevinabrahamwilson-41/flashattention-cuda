@@ -102,17 +102,9 @@ The kernel computes softmax incrementally as successive K/V tiles are processed.
 
 For each query row, the running maximum and normalization factor are updated using:
 
-$$
-m_{\mathrm{new}} = \max(m_{\mathrm{old}}, m_{\mathrm{tile}})
-$$
+$$m_{new} = \max(m_{old}, m_{tile})$$
 
-$$
-d_{\mathrm{new}}
-=
-e^{m_{\mathrm{old}}-m_{\mathrm{new}}}d_{\mathrm{old}}
-+
-e^{m_{\mathrm{tile}}-m_{\mathrm{new}}}
-$$
+$$d_{new} = e^{m_{old}-m_{new}} d_{old} + e^{m_{tile}-m_{new}}$$
 
 The accumulated output is rescaled using the same correction factor.
 
@@ -528,7 +520,7 @@ The kernel is currently optimized around NVIDIA Ada Lovelace-class hardware and 
 ## Repository Structure
 
 ```text
-flashattention-cuda/
+flashattentionV2-cuda/
 ├── flashattention.cu
 ├── flashattention.h
 └── README.md
@@ -556,7 +548,7 @@ Contains the public kernel interface, configuration structures, and supporting d
 
 ---
 
-## 🛠️ Prerequisites
+## Prerequisites
 
 Recommended environment:
 
@@ -565,15 +557,15 @@ Recommended environment:
 * NVCC
 * C++17-compatible host compiler
 * Linux environment recommended
-
-For NVIDIA Ada Lovelace GPUs using compute capability 8.9:
+* 
+## Build & Run
 
 ```bash
-nvcc -O3 -std=c++20 -arch=sm_89 \
-    -c flashattention.cu \
-    -o flashattention.o
+nvcc -O3 -std=c++20 -arch=sm_89 flashattention.cu -o flashattention
+nvcc -O3 -std=c++20 -arch=sm_89 stress_test_flashattention.cu flashattention.cu -o stress_test_flashattention
+./flashattention
+./stress_test_flashattention
 ```
-
 For a different GPU architecture, change the `-arch` value accordingly.
 
 Examples:
