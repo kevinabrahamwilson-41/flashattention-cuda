@@ -101,7 +101,10 @@ __global__ void flash_attention_fat_kernel(
     const T *__restrict__ Q, const T *__restrict__ K, const T *__restrict__ V,
     T *__restrict__ O, float *__restrict__ LSE, const int q_seq_len,
     const int kv_seq_len, const int kv_stride, const int num_q_heads, const int num_kv_heads, const float scale) {
-  static_assert(BLOCK_M == 16 * NUM_WARPS, "one m16 tile per warp");
+  static_assert(BLOCK_M % NUM_WARPS == 0,
+                "BLOCK_M must divide evenly across warps");
+  static_assert(BLOCK_M / NUM_WARPS == 16,
+                "FA2 Split-Q requires one m16 Q tile per warp");
   static_assert(BLOCK_N % 16 == 0 && D_HEAD % 16 == 0, "tile granularity");
   static_assert(BLOCK_M <= BLOCK_N, "Q stages through smem_k");
 
@@ -114,18 +117,18 @@ __global__ void flash_attention_fat_kernel(
   constexpr int THREADS = WARP_SIZE_FA * NUM_WARPS;
   if (q_start >= q_seq_len)
     return;
-
   constexpr int SMEM_PAD = 8;
   constexpr int KV_STRIDE = D_HEAD + SMEM_PAD;
   constexpr int QK_N8 = BLOCK_N / 8;     // score n8-tiles per warp (full BN)
   constexpr int TILES_K = D_HEAD / 16;   // k16-tiles for Q*K^T
   constexpr int PV_N8 = D_HEAD / 8;      // output n8-tiles per warp (full D)
   constexpr int TILES_BN = BLOCK_N / 16; // k16-tiles for P*V
-
   extern __shared__ char smem_raw[];
-  T *smem_k = reinterpret_cast<T *>(smem_raw);
-  T *smem_v = smem_k + BLOCK_N * KV_STRIDE;
-
+  constexpr int SMEM_STAGES = 2;
+  T *smem_k =
+      reinterpret_cast<T *>(smem_raw);
+  T *smem_v =
+      smem_k + SMEM_STAGES * BLOCK_N * KV_STRIDE;
   const int b = bh_idx / num_q_heads;
   const int h_q = bh_idx - b * num_q_heads;
   const int h_kv = h_q / (num_q_heads / num_kv_heads);
@@ -138,9 +141,10 @@ __global__ void flash_attention_fat_kernel(
   const T *V_head = V + kv_off;
   T *O_head = O + q_off;
 
-  const int mi = warp_id;
+  constexpr int Q_ROWS_PER_WARP = BLOCK_M / NUM_WARPS;
+  const int q_warp_start = warp_id * Q_ROWS_PER_WARP;
   const int local_row0 = (lane_id / 4) % 8;
-  const int global_row0 = mi * 16 + local_row0;
+  const int global_row0 = q_warp_start + local_row0;
   const int global_row1 = global_row0 + 8;
   const float scale2 = scale * 1.4426950408889634f;
   uint32_t q_frag[TILES_K][4];
@@ -160,57 +164,67 @@ __global__ void flash_attention_fat_kernel(
       int row = lane_id % 16;
       int col = (lane_id / 16) * 8;
       ldmatrix_x4(q_frag[ki][0], q_frag[ki][1], q_frag[ki][2], q_frag[ki][3],
-                  smem_k + (mi * 16 + row) * KV_STRIDE + ki * 16 + col);
+                  smem_k + (q_warp_start + row) * KV_STRIDE + ki * 16 + col);
     }
     __syncthreads(); // Q in regs; smem_k free for K
   }
-
   float o_acc[PV_N8][4] = {{0}};
-  float row_max0 = -FLT_MAX, row_max1 = -FLT_MAX;
-  float row_sum0 = 0.0f, row_sum1 = 0.0f;
-
-  const int kv_end = kv_seq_len;
-  //CAUSAL ? min(q_start + BLOCK_M, seq_len) : seq_len;
-  const int num_kv_tiles = (kv_end + BLOCK_N - 1) / BLOCK_N;
-
+  float row_max0 = -INFINITY;
+  float row_max1 = -INFINITY;
+  float row_sum0 = 0.0f;
+  float row_sum1 = 0.0f;
+  const int causal_kv_end =
+      CAUSAL
+          ? min(kv_seq_len, q_offset + q_start + BLOCK_M)
+          : kv_seq_len;
+  const int num_kv_tiles =
+      (causal_kv_end + BLOCK_N - 1) / BLOCK_N;
   constexpr int VEC_COLS = D_HEAD / 8;
-  auto issue_k = [&](int kv_start_i, int kv_count_i) {
+  auto issue_k = [&](int kv_start_i, int kv_count_i, int stage) {
+    T *k_stage =
+        smem_k + stage * BLOCK_N * KV_STRIDE;
 #pragma unroll
     for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
-      int row = idx / VEC_COLS, col = idx % VEC_COLS;
-      bool valid = (row < kv_count_i);
-      cp_async_16(reinterpret_cast<uint4 *>(smem_k + row * KV_STRIDE) + col,
-                  reinterpret_cast<const uint4 *>(
-                      K_head + (size_t)(kv_start_i + row) * D_HEAD) +
-                      col,
-                  valid);
+        int row = idx / VEC_COLS;
+        int col = idx % VEC_COLS;
+        bool valid = (row < kv_count_i);
+        cp_async_16(
+            reinterpret_cast<uint4 *>(k_stage + row * KV_STRIDE) + col,
+            reinterpret_cast<const uint4 *>(
+                K_head + (size_t)(kv_start_i + row) * D_HEAD) + col,
+            valid);
     }
     cp_async_commit_group();
-  };
-  issue_k(0, min(BLOCK_N, kv_seq_len)); // prologue: K(0)
+    };
+  issue_k(0, min(BLOCK_N, kv_seq_len), 0); // prologue: K(0)
 
   for (int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
     const int kv_start = kv_tile * BLOCK_N;
     const int kv_count = min(BLOCK_N, kv_seq_len - kv_start);
-
-    cp_async_wait_group<0>(); // K(i) landed (only group in flight here)
-    __syncthreads();          // K visible to all warps
-
-    // V(i): streams behind QK + softmax.
-    {
-#pragma unroll
-      for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
-        int row = idx / VEC_COLS, col = idx % VEC_COLS;
-        bool valid = (row < kv_count);
-        cp_async_16(reinterpret_cast<uint4 *>(smem_v + row * KV_STRIDE) + col,
-                    reinterpret_cast<const uint4 *>(
-                        V_head + (size_t)(kv_start + row) * D_HEAD) +
-                        col,
-                    valid);
+  const bool full_causal_tile =
+      !CAUSAL ||
+      (kv_start + BLOCK_N <= q_offset + q_start);
+      const int stage = kv_tile & 1;
+      T *k_stage =
+          smem_k + stage * BLOCK_N * KV_STRIDE;
+      T *v_stage =
+          smem_v + stage * BLOCK_N * KV_STRIDE;
+      cp_async_wait_group<0>();
+      __syncthreads();
+      {
+      #pragma unroll
+          for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
+              int row = idx / VEC_COLS;
+              int col = idx % VEC_COLS;
+              bool valid = (row < kv_count);
+              cp_async_16(
+                  reinterpret_cast<uint4 *>(v_stage + row * KV_STRIDE) + col,
+                  reinterpret_cast<const uint4 *>(
+                      V_head + (size_t)(kv_start + row) * D_HEAD) + col,
+                  valid);
+          }
+          cp_async_commit_group();
       }
-      cp_async_commit_group();
-    }
-
     // -- Step A: S = Q * K^T, full BN per warp ------------------------------
     float s_acc[QK_N8][4];
 #pragma unroll
@@ -222,7 +236,7 @@ __global__ void flash_attention_fat_kernel(
         int k_row = lane_id % 8;
         int mat = (lane_id / 8) % 2;
         ldmatrix_x2(b0, b1,
-                    smem_k + (ni * 8 + k_row) * KV_STRIDE + ki * 16 + mat * 8);
+                    k_stage + (ni * 8 + k_row) * KV_STRIDE + ki * 16 + mat * 8);
         ptx_mma_m16n8k16<T>(s_acc[ni][0], s_acc[ni][1], s_acc[ni][2],
                             s_acc[ni][3], q_frag[ki][0], q_frag[ki][1],
                             q_frag[ki][2], q_frag[ki][3], b0, b1, s_acc[ni][0],
@@ -233,22 +247,22 @@ __global__ void flash_attention_fat_kernel(
 #pragma unroll
       for (int i = 0; i < 4; i++)
         s_acc[ni][i] *= scale2;
-      if (CAUSAL) {
-          if (kv_start + s_col0 > q_offset + q_start + global_row0)
-              s_acc[ni][0] = -FLT_MAX;
-          if (kv_start + s_col1 > q_offset + q_start + global_row0)
-              s_acc[ni][1] = -FLT_MAX;
-          if (kv_start + s_col0 > q_offset + q_start + global_row1)
-              s_acc[ni][2] = -FLT_MAX;
-          if (kv_start + s_col1 > q_offset + q_start + global_row1)
-              s_acc[ni][3] = -FLT_MAX;
-      }
-      if (s_col0 >= kv_count) { s_acc[ni][0] = -FLT_MAX; s_acc[ni][2] = -FLT_MAX; }
-      if (s_col1 >= kv_count) { s_acc[ni][1] = -FLT_MAX; s_acc[ni][3] = -FLT_MAX; }
+        if (!full_causal_tile) {
+            if (kv_start + s_col0 > q_offset + q_start + global_row0)
+                s_acc[ni][0] = -INFINITY;
+            if (kv_start + s_col1 > q_offset + q_start + global_row0)
+                s_acc[ni][1] = -INFINITY;
+            if (kv_start + s_col0 > q_offset + q_start + global_row1)
+                s_acc[ni][2] = -INFINITY;
+            if (kv_start + s_col1 > q_offset + q_start + global_row1)
+                s_acc[ni][3] = -INFINITY;
+        }
+      if (s_col0 >= kv_count) { s_acc[ni][0] = -INFINITY; s_acc[ni][2] = -INFINITY; }
+      if (s_col1 >= kv_count) { s_acc[ni][1] = -INFINITY; s_acc[ni][3] = -INFINITY; }
     }
 
     // -- Step B: intra-warp softmax; exp overwrites s_acc (P stays in regs) --
-    float pmax0 = -FLT_MAX, pmax1 = -FLT_MAX;
+    float pmax0 = -INFINITY, pmax1 = -INFINITY;
 #pragma unroll
     for (int ni = 0; ni < QK_N8; ni++) {
       pmax0 = fmaxf(pmax0, fmaxf(s_acc[ni][0], s_acc[ni][1]));
@@ -262,18 +276,20 @@ __global__ void flash_attention_fat_kernel(
     float prev_max0 = row_max0, prev_max1 = row_max1;
     float new_max0 = fmaxf(prev_max0, pmax0);
     float new_max1 = fmaxf(prev_max1, pmax1);
-
     float psum0 = 0.0f, psum1 = 0.0f;
 #pragma unroll
-    for (int ni = 0; ni < QK_N8; ni++) {
-      float e0 = (s_acc[ni][0] > -FLT_MAX * 0.5f) ? exp2f(s_acc[ni][0] - new_max0) : 0.0f;
-      float e1 = (s_acc[ni][1] > -FLT_MAX * 0.5f) ? exp2f(s_acc[ni][1] - new_max0) : 0.0f;
-      float e2 = (s_acc[ni][2] > -FLT_MAX * 0.5f) ? exp2f(s_acc[ni][2] - new_max1) : 0.0f;
-      float e3 = (s_acc[ni][3] > -FLT_MAX * 0.5f) ? exp2f(s_acc[ni][3] - new_max1) : 0.0f;
-      psum0 += e0 + e1;
-      psum1 += e2 + e3;
-      s_acc[ni][0] = e0; s_acc[ni][1] = e1; s_acc[ni][2] = e2; s_acc[ni][3] = e3;
-    }
+for (int ni = 0; ni < QK_N8; ni++) {
+    float e0 = exp2f(s_acc[ni][0] - new_max0);
+    float e1 = exp2f(s_acc[ni][1] - new_max0);
+    float e2 = exp2f(s_acc[ni][2] - new_max1);
+    float e3 = exp2f(s_acc[ni][3] - new_max1);
+    psum0 += e0 + e1;
+    psum1 += e2 + e3;
+    s_acc[ni][0] = e0;
+    s_acc[ni][1] = e1;
+    s_acc[ni][2] = e2;
+    s_acc[ni][3] = e3;
+}
 #pragma unroll
     for (int d = 1; d < 4; d <<= 1) {
       psum0 += __shfl_xor_sync(0xFFFFFFFFu, psum0, d);
@@ -294,14 +310,12 @@ __global__ void flash_attention_fat_kernel(
       o_acc[di][2] *= corr1;
       o_acc[di][3] *= corr1;
     }
-
-    cp_async_wait_group<0>(); // this thread's V arrived
+    cp_async_wait_group<0>(); // wait for all prior async-copy groups
     __syncthreads();          // all threads' V visible; K(i) dead CTA-wide
-
     // K(i+1): streams behind PV into the now-dead smem_k.
     if (kv_tile + 1 < num_kv_tiles) {
       int ks = (kv_tile + 1) * BLOCK_N;
-      issue_k(ks, min(BLOCK_N, kv_seq_len - ks));
+      issue_k(ks, min(BLOCK_N, kv_seq_len - ks), (kv_tile + 1) & 1);
     }
 #pragma unroll
     for (int ki = 0; ki < TILES_BN; ki++) {
@@ -314,7 +328,7 @@ __global__ void flash_attention_fat_kernel(
         uint32_t b0, b1;
         int v_row = lane_id % 8 + ((lane_id / 8) % 2) * 8;
         ldmatrix_x2_trans(b0, b1,
-                          smem_v + (ki * 16 + v_row) * KV_STRIDE + di * 8);
+                          v_stage + (ki * 16 + v_row) * KV_STRIDE + di * 8);
         ptx_mma_m16n8k16<T>(o_acc[di][0], o_acc[di][1], o_acc[di][2],
                             o_acc[di][3], a0, a1, a2, a3, b0, b1, o_acc[di][0],
                             o_acc[di][1], o_acc[di][2], o_acc[di][3]);
@@ -374,11 +388,11 @@ template <int D_HEAD, class T>
 inline void launch_fat_variant(const FlashAttentionParams &params) {
   constexpr int BM = 64, BN = 64, NW = 4;
   constexpr int KV_STRIDE = D_HEAD + 8;
-
   const int grid_x = (params.q_seq_len + BM - 1) / BM;
   dim3 grid(grid_x, params.batch_size * params.num_heads);
   dim3 block(WARP_SIZE_FA, NW);
-  size_t smem_bytes = 2 * (size_t)BN * KV_STRIDE * sizeof(T);
+  constexpr int STAGES = 2;
+  size_t smem_bytes = 2 * STAGES * (size_t)BN * KV_STRIDE * sizeof(T);
 
   const int H_q = params.num_heads;
   const int H_kv =
